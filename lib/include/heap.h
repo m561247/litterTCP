@@ -28,10 +28,11 @@
 #include "class.h"
 
 #define alignment_byte               0x07
-#define config_heap   (10 * 1024)
+#define config_heap   (1000 * 1024)
 
 void *heap_malloc(size_t WantSize);
 void heap_free(void *xReturn);
 
+//#define auto_free __attribute__((cleanup(heap_free)))
 
 #endif

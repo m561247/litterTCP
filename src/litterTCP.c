@@ -1,31 +1,88 @@
 #include "litterTCP.h"
+#include "buf.h"
+#include "queue.h"
 #include "port.h"
-#include "lib/link_list.h"
-#include "lib/queue.h"
+#include "heap.h"
 
-struct buf *buf_get(uint16_t size)
-{
-    uint16_t tol_len = sizeof(struct buf) + MAX_HDR_LEN + size;
-    struct buf *sk = heap_malloc(tol_len);
-    *sk = (struct buf) {
-        .data_len = size,
-        .data_mes_len = size,
-        .data = sk->data_buf + MAX_HDR_LEN - 24,
-        .type = BUF_DATA,
-    };
-    list_node_init(&(sk->node));
-    return sk;
-}
-
-
-void buf_free(struct buf *sk)
-{
-    heap_free(sk);
-}
-
+ifnet_class *if_que = NULL;
 
 struct list_node EthReadyQue;
 struct list_node EthOutQue;
+
+struct arp_cache AcHead;
+struct list_node ArpInQue;
+
+unsigned char broadcast_mac[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+
+struct list_node IpInQue;
+
+unsigned int ISS = 10086;
+struct list_node TcpInpcb;
+
+struct list_node InpQue;
+int SocketFd = 0;
+struct socket *SocketHash[100];
+
+void buf_dump(struct buf *sk)
+{
+    if (!sk) {
+        printf("buf_dump: sk=NULL\n");
+        return;
+    }
+
+    printf("---- buf_dump ----\n");
+    printf("buf=%p\n", sk);
+    printf("data=%p\n", sk->data);
+    printf("data_len=%u\n", sk->data_len);
+    printf("data_mes_len=%u\n", sk->data_mes_len);
+    printf("type=%u\n", sk->type);
+    printf("-------------------\n");
+
+    uint8_t *p = sk->data;
+    uint16_t len = sk->data_len;
+
+    for (uint16_t i = 0; i < len; i += 16) {
+        printf("%04x  ", i);
+
+        // hex part
+        for (uint16_t j = 0; j < 16; j++) {
+            if (i + j < len)
+                printf("%02x ", p[i + j]);
+            else
+                printf("   ");
+        }
+
+        printf(" ");
+
+        // ascii part
+        for (uint16_t j = 0; j < 16; j++) {
+            if (i + j < len) {
+                uint8_t c = p[i + j];
+                printf("%c", (c >= 32 && c <= 126) ? c : '.');
+            }
+        }
+
+        printf("\n");
+    }
+
+    printf("-------------------\n");
+}
+
+void ifnet_register(ifnet_class *ifp)
+{
+    ifp->if_next = NULL;
+
+    if (if_que == NULL) {
+        if_que = ifp;
+        return;
+    }
+
+    ifnet_class *cur = if_que;
+    while (cur->if_next != NULL)
+        cur = cur->if_next;
+
+    cur->if_next = ifp;
+}
 
 void eth_init()
 {
@@ -41,18 +98,19 @@ void ether_send(ifnet_class *ifp)
 
     while(sk_node = queue_dequeue(&EthOutQue)) {
         sk = container_of(sk_node, struct buf, node);
-        ifp->output(ifp, sk, sk->data_len);
+        ifp->output(sk);
         buf_free(sk);
     }
 }
 
 void ether_input(ifnet_class *ifp)
 {
-    struct buf *sk = tapif_input();
+    struct buf *sk = ifp->input();
     if (sk == NULL) {
         SYS_ERROR("SK none!");
         goto freeit;
     }
+    //buf_dump(sk);
 
     struct eth_hdr *eh = (struct eth_hdr *)sk->data;
     if ((memcmp(eh->ether_dhost, ifp->hwaddr, 6) == 0) || 
@@ -112,10 +170,8 @@ void ether_output(ifnet_class *ifp, struct buf *sk, struct _sockaddr *dst)
             
             eh->ether_type = htons(ETHERTYPE_IP);
             if (arp_resolve(ifp, sk, dst)) {
-                printf("ether_output mac get\r\n");
                 pkt = (struct eth_hdr *)dst;
                 memcpy(eh->ether_dhost, pkt->ether_dhost, 6); 
-                print_mac(eh->ether_dhost);
                 queue_enqueue(&EthOutQue, &sk->node);
             } 
             
@@ -130,17 +186,9 @@ void ether_output(ifnet_class *ifp, struct buf *sk, struct _sockaddr *dst)
         default:
             break;
     } 
-
+    //buf_dump(sk);
     ether_send(ifp);
 }
-
-
-
-struct arp_cache AcHead;
-struct list_node ArpInQue;
-
-unsigned char broadcast_mac[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
-
 
 void arp_init()
 {
@@ -209,7 +257,6 @@ void arp_request(ifnet_class *ifp, unsigned int *sip, unsigned int *tip)
 
     sa.sa_family = AF_UNSPEC;
     sa.sa_len = sizeof(sa);
-    
     ether_output(ifp, sk, &sa);
 }
 
@@ -257,10 +304,6 @@ void arp_eth_ready_que_cpy_mac(ifnet_class *ifp, struct arp_ether *ap)
         eh = (struct eth_hdr *)(sk->data);
         if (ip->ip_dst.addr == ap->arp_spa) { 
             memcpy(eh->ether_dhost, ap->arp_sha, 6);
-
-            print_mac(eh->ether_dhost);
-            printf("eth ready queue get mac\r\n");
-
             list_remove(sk_node);
             queue_enqueue(&EthOutQue, sk_node);
         }
@@ -300,14 +343,10 @@ void arp_input(ifnet_class *ifp)
             ac = heap_malloc(sizeof(struct arp_cache));
             ac->ipaddr = ap->arp_spa;
             memcpy(ac->hwaddr, ap->arp_sha, 6);
-            printf("ac.ip has add\r\n");
             queue_enqueue(&AcHead.node, &ac->node);
         }
 
         arp_eth_ready_que_cpy_mac(ifp, ap);
-
-        printf("arp_input mac record\r\n");
-        print_mac(ap->arp_sha);
         
         switch (ntohs(ah->ar_op))
         {
@@ -354,6 +393,25 @@ unsigned short in_checksum(void *b, int len)
 struct rtentry routing_table[MAX_ROUTES];
 int route_count = 0;
 
+int route_add(uint32_t dest, uint32_t netmask, uint32_t gateway, ifnet_class *ifp)
+{
+    if (route_count >= MAX_ROUTES) {
+        printf("route_add: routing table full!\n");
+        return -1;
+    }
+
+    routing_table[route_count] = (struct rtentry) {
+        .dest    = dest,
+        .netmask = netmask,
+        .gateway = gateway,
+        .ifp     = ifp,
+    };
+
+    route_count++;
+    return 0;
+}
+
+
 struct rtentry* rtlookup(uint32_t dst) {
     struct rtentry *best = NULL;
     uint32_t best_mask = 0;
@@ -368,8 +426,6 @@ struct rtentry* rtlookup(uint32_t dst) {
     return best;
 }
 
-
-struct list_node IpInQue;
 void ip_init()
 {
     list_node_init(&IpInQue);
@@ -383,6 +439,36 @@ void ip_InQue_add_tail(struct buf *sk)
 void ip_InQue_remove_tail(struct buf *sk)
 {
     queue_dequeue(&IpInQue);
+}
+
+int is_local_ip(struct _in_addr ip)
+{
+    ifnet_class *ifp;
+
+    uint32_t target = ntohl(ip.addr);  
+
+    for (ifp = if_que; ifp != NULL; ifp = ifp->if_next) {
+        uint32_t my_ip   = ifp->ipaddr.addr;  
+        uint32_t netmask = ifp->netmask.addr;
+
+        if (target == my_ip)
+            return 1;
+
+        if ((target & netmask) == (my_ip & netmask))
+            return 1;
+
+        uint32_t broadcast = (my_ip & netmask) | (~netmask);
+        if (target == broadcast)
+            return 1;
+
+        if (target == 0)
+            return 1;
+
+        if ((target & 0xFF000000) == 0x7F000000)
+            return 1;
+    }
+
+    return 0;
 }
 
 void ip_forward(struct buf *sk, struct ip_struct *ip)
@@ -530,18 +616,15 @@ int ip_output(struct buf *sk, struct _sockaddr_in *sa)
     struct _sockaddr dst;
     dst.sa_family = AF_INET;
     ((struct _sockaddr_in*)&dst)->sin_addr.addr = nexthop;
-
+    //buf_dump(sk);
     ether_output(ifp, sk, &dst);
     return true;
 }
-
-
 
 void icmp_send(struct buf *sk)
 {
     struct ip_struct *ip;
     struct _sockaddr_in sa;
-    printf("send\r\n");
 
     sk->data -= sizeof(struct ip_struct);
     sk->data_len += sizeof(struct ip_struct);
@@ -571,13 +654,10 @@ void icmp_input(struct buf *sk, int hlen)
 {
     struct icmp *icp;
     icp = (struct icmp *)sk->data;
-    print_content((char *)icp, sizeof(struct icmp));
 
     switch (icp->icmp_type)
     {
     case ICMP_ECHO:
-        printf("icmp echo!\r\n");
-        
         icmp_reflect(sk);
         
         break;
@@ -588,8 +668,121 @@ void icmp_input(struct buf *sk, int hlen)
 
 }
 
+int in_pcballoc(struct socket *so, struct list_node *head)
+{
+	struct inpcb *inp = heap_malloc(sizeof(struct inpcb));
+	if (inp == NULL) {
+		SYS_ERROR("socket NULL!!!");
+		return ERROR;
+	}
+	*inp = (struct inpcb) {
+		.inp_socket = so,
+	};
+	list_node_init(&(inp->node));
+	queue_enqueue(head, &inp->node);
+	so->so_pcb = (void *)inp;	
+	return 0;
+}
 
 
+int in_pcbfree(struct inpcb *inp)
+{
+	list_remove(&inp->node);
+	heap_free(inp);
+}
+
+struct inpcb *in_pcblookup(struct list_node *head, struct _in_addr faddr, struct _in_addr laddr, 
+						unsigned int fport, unsigned int lport)
+{
+	struct list_node *inp_node; 
+	struct inpcb *inp = NULL;
+	struct inpcb *match_pcb = NULL;
+	char count = 0;
+	char max_match = 0;
+	for(inp_node = head->next; inp_node != head; inp_node = inp_node->next) {
+		inp = container_of(inp_node, struct inpcb, node);
+		printf("inpcb 38 is %p\n", inp);
+		if ((lport == INADDR_ANY) || 
+			(inp->inp_lport == lport)) {
+			count++;
+		} 
+		if ((inp->inp_laddr.addr == INADDR_ANY) || 
+			(inp->inp_laddr.addr == laddr.addr)) {
+			count++;
+		}
+
+		if (inp->inp_fport == fport) {
+			count++;
+		}
+		if (inp->inp_faddr.addr == faddr.addr) {
+			count++;
+		}
+
+		if (count > max_match) {
+			max_match = count;
+			match_pcb = inp;
+		}
+		count = 0;
+	}
+
+	if (match_pcb == NULL) {
+		SYS_ERROR("inpcb no find!");
+	}
+
+	return match_pcb;
+}
+
+
+int in_pcbbind(struct inpcb *inp, struct _sockaddr_in *sin)
+{
+	if (sin->sin_family != AF_INET) {
+		SYS_ERROR("sin_family is error!");
+		return ERROR;
+	}
+
+	inp->inp_laddr = sin->sin_addr;
+	inp->inp_lport = sin->sin_port;  
+}
+
+int in_pcbconnect(struct inpcb *inp, struct _sockaddr_in *fsin)
+{
+	if (fsin->sin_family != AF_INET) {
+		SYS_ERROR("sin_family is error!");
+		return ERROR;
+	}
+	
+	if (fsin->sin_port == 0) {
+		SYS_ERROR("port is 0");
+		return ERROR;
+	}
+	
+	inp->inp_faddr = fsin->sin_addr;
+	inp->inp_fport = fsin->sin_port;
+	return	0;
+}
+
+int in_pcbdisconnect(struct inpcb *inp)
+{
+	inp->inp_faddr.addr = INADDR_ANY;
+	inp->inp_fport = 0;
+	return true;
+}
+
+int in_setsockaddr(struct inpcb *inp, struct _sockaddr_in *lsin)
+{
+	lsin->sin_family = AF_INET;
+	lsin->sin_len = sizeof(*lsin);
+	lsin->sin_port = inp->inp_lport;
+	lsin->sin_addr = inp->inp_laddr;
+}
+
+int in_setpeeraddr(struct inpcb *inp, struct _sockaddr_in *fsin)
+{
+	fsin->sin_family = AF_INET;
+	fsin->sin_len = sizeof(*fsin);
+	fsin->sin_port = inp->inp_fport;
+	fsin->sin_addr = inp->inp_faddr;
+}
 
 void udp_input(struct buf *sk, int iphlen)
 {
@@ -685,13 +878,6 @@ int udp_output(struct inpcb *inp, struct buf *sk, struct _sockaddr  *sa)
 	return error;
 }
 
-
-
-
-unsigned int ISS = 10086;
-struct list_node TcpInpcb;
-
-
 void tcp_init()
 {
     list_node_init(&TcpInpcb);
@@ -753,11 +939,6 @@ void tcp_input(struct buf *sk, int iphlen)
     unsigned int ack = ntohl(ti->ti_t.th_ack);
     unsigned int seq = ntohl(ti->ti_t.th_seq);
     int flags = ti->ti_t.th_flags;
-    printf("flags:%d\r\n", flags);
-    printf("tp->state:%d\r\n", tp->t_state);
-
-    printf("ack for sk:%u\r\n", ack);
-    printf("seq for sk:%u\r\n", seq);
 
     switch (tp->t_state)
     {
@@ -789,11 +970,10 @@ void tcp_input(struct buf *sk, int iphlen)
         tp->snd_nxt = ISS + 1;
         tp->rcv_nxt = ntohl(ti->ti_t.th_seq) + 1;
 
-        printf("listen\r\n");
         tp->t_state = TCP_SYN_RECEIVED;
         struct buf *sk_syn_ack = buf_get(0);
         sk_syn_ack->data_len = sizeof(struct tcpiphdr);
-        tcp_send_syn_ack(tp, sk_syn_ack);
+        tcp_respond(tp, sk_syn_ack, tp->rcv_nxt, tp->iss, TH_SYN | TH_ACK);
 
         return;
 
@@ -913,12 +1093,32 @@ void tcp_input(struct buf *sk, int iphlen)
         return;
     }
 
+    case TCP_FIN_WAIT_1: {
+        uint32_t seqno = ntohl(ti->ti_t.th_seq);
+        uint32_t ackno = ntohl(ti->ti_t.th_ack);
 
-    case TCP_FIN_WAIT_1:
-        printf("FIN_WAIT1\r\n");
-        tp->t_state = TCP_FIN_WAIT_2;
+        if (flags & TH_ACK) {
+            if (SEQ_GT(ackno, tp->snd_una) && SEQ_LEQ(ackno, tp->snd_nxt)) {
+                tp->snd_una = ackno;
+                if (ackno == tp->snd_nxt) {
+                    tp->t_state = TCP_FIN_WAIT_2;
+                }
+            }
+        }   
 
-    break;
+        if (flags & TH_FIN) {
+            if (SEQ_EQ(seqno, tp->rcv_nxt)) {
+                tp->rcv_nxt++;
+
+                struct buf *sk_ack = buf_get(0);
+                sk_ack->data_len = sizeof(struct tcpiphdr);
+                tcp_respond(tp, sk_ack, tp->rcv_nxt, tp->snd_nxt, TH_ACK);
+
+                tp->t_state = TCP_TIME_WAIT;
+            }
+        }
+        return;
+    }
 
     case TCP_CLOSE_WAIT:
         printf("CLOSE_WAIT\r\n");
@@ -942,22 +1142,29 @@ void tcp_input(struct buf *sk, int iphlen)
         return;
 
 
-    case TCP_FIN_WAIT_2:
-        if ((flags & (TH_FIN|TH_ACK)) == (TH_FIN|TH_ACK)) {
-            printf("TH_FIN_WAIT2: got FIN+ACK\n");
+    case TCP_FIN_WAIT_2: {
+        uint32_t seqno = ntohl(ti->ti_t.th_seq);
+        uint32_t ackno = ntohl(ti->ti_t.th_ack);
 
-            tp->rcv_nxt = ntohl(ti->ti_t.th_seq) + 1;
-            tp->snd_una = ntohl(ti->ti_t.th_ack);
+        if (flags & TH_FIN) {
+            if (SEQ_EQ(seqno, tp->rcv_nxt)) {
+                tp->rcv_nxt++;
 
-            struct buf *sk_close_ack = buf_get(0);
-            sk_close_ack->data_len = sizeof(struct tcpiphdr);
-            tcp_respond(tp, sk_close_ack, tp->rcv_nxt, tp->snd_nxt, TH_ACK|TH_FIN);
+                if (flags & TH_ACK) {
+                    if (SEQ_GT(ackno, tp->snd_una) && SEQ_LEQ(ackno, tp->snd_nxt)) {
+                        tp->snd_una = ackno;
+                    }
+                }   
 
-            tp->t_state = TCP_TIME_WAIT;
-            //ToDo: start 2MSL
-            //start_timewait_timer(tp); 
-        }
+                struct buf *sk_ack = buf_get(0);
+                sk_ack->data_len = sizeof(struct tcpiphdr);
+                tcp_respond(tp, sk_ack, tp->rcv_nxt, tp->snd_nxt, TH_ACK); 
+
+                tp->t_state = TCP_TIME_WAIT;
+            }
+        }   
         return;
+    }
 
     default:
 
@@ -969,49 +1176,51 @@ free:
 
 }
 
-
-
 void tcp_respond(struct tcpcb *tp, struct buf *sk, tcp_seq ack, tcp_seq seq, int flags)
 {
     struct tcpiphdr *ti;
-	struct _sockaddr_in *sa;
-	int win = 1024;
-	struct route *ro;
- 
+    struct _sockaddr_in sa;
+    int win = 65535;
+
     ti = (struct tcpiphdr *)sk->data;
 
     ti->ti_i.ih_next = ti->ti_i.ih_prev = 0;
-	ti->ti_i.ih_x1 = 0;
-	ti->ti_i.ih_pr = IPPROTO_TCP;
-	ti->ti_i.ih_len = htons(sk->data_len - sizeof(struct ip_struct));
+    ti->ti_i.ih_x1   = 0;
+    ti->ti_i.ih_pr   = IPPROTO_TCP;
+    ti->ti_i.ih_len  = htons(sk->data_len - sizeof(struct ip_struct));
 
-    ti->ti_i.ih_dst = tp->t_inpcb->inp_faddr;
-    ti->ti_i.ih_src = tp->t_inpcb->inp_laddr;
+    ti->ti_i.ih_dst  = tp->t_inpcb->inp_faddr;
+    ti->ti_i.ih_src  = tp->t_inpcb->inp_laddr;
 
     ti->ti_t.th_dport = tp->t_inpcb->inp_fport;
     ti->ti_t.th_sport = tp->t_inpcb->inp_lport;
-	ti->ti_t.th_seq = htonl(seq);
-	ti->ti_t.th_ack = htonl(ack);
-	ti->ti_t.th_x2 = 0;
-	ti->ti_t.th_off = (sk->data_len - sizeof(struct ip_struct) - sk->data_mes_len) >> 2;
-	ti->ti_t.th_flags = flags;
-	ti->ti_t.th_win = htons((unsigned short)win);
-    ti->ti_t.th_urp = 0;
-    ti->ti_t.th_sum = 0;
-    ti->ti_t.th_sum = in_checksum(ti, sk->data_len);
+    ti->ti_t.th_seq   = htonl(seq);
+    ti->ti_t.th_ack   = htonl(ack);
+    ti->ti_t.th_x2    = 0;
 
-    sa = (struct _sockaddr_in *)&(tp->t_inpcb->sa_dst);
-    sa->sin_family = AF_INET;
-    sa->sin_addr.addr = ti->ti_i.ih_dst.addr;
-    sa->sin_len = sizeof(*sa);
+    if (sk->data_mes_len == 0) {
+        ti->ti_t.th_off = (sizeof(struct tcphdr)) >> 2;
+    } else {
+        ti->ti_t.th_off =
+            (sk->data_len - sizeof(struct ip_struct) - sk->data_mes_len) >> 2;
+    }
+
+    ti->ti_t.th_flags = flags;
+    ti->ti_t.th_win   = htons((unsigned short)win);
+    ti->ti_t.th_urp   = 0;
+    ti->ti_t.th_sum   = 0;
+    ti->ti_t.th_sum   = in_checksum(ti, sk->data_len);
+
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family    = AF_INET;
+    sa.sin_addr      = ti->ti_i.ih_dst;
+    sa.sin_len       = sizeof(sa);
 
     sk->type = IPPROTO_TCP;
-    
-    ip_output(sk, ro);
+
+    ip_output(sk, &sa);
 }
 
-
-unsigned int ISS;
 void tcp_send_syn(struct tcpcb *tp, struct buf *sk) 
 {
     sk->data -= sizeof(struct tcpiphdr); 
@@ -1024,8 +1233,6 @@ void tcp_send_syn(struct tcpcb *tp, struct buf *sk)
     tcp_respond(tp, sk, tp->rcv_nxt, tp->iss, TH_SYN);
 }
 
-
-
 void tcp_send_fin(struct tcpcb *tp, struct buf *sk) 
 {
     printf("send FIN\n");
@@ -1034,12 +1241,6 @@ void tcp_send_fin(struct tcpcb *tp, struct buf *sk)
 
     tp->t_state = TCP_FIN_WAIT_1;
 }
-
-
-
-struct list_node InpQue;
-int SocketFd = 0;
-struct socket *SocketHash[100];
 
 void socket_init()
 {
@@ -1062,7 +1263,6 @@ int _socket(int domain, int type, int protocol)
     }
     
     struct inpcb *inp = so->so_pcb;
-    printf("_socket 37 inp is:%p\r\n", inp);
 
     sem_init(&inp->recv_sem, 0, 0);
     sem_init(&inp->send_sem, 0, 0);
@@ -1132,8 +1332,6 @@ int _accept(int sockfd, struct _sockaddr *addr, socklen_t *addrlen)
     return new_fd;
 }
 
-
-
 int _connect(int sockfd, struct _sockaddr *addr)
 {
     struct socket *so = SocketHash[sockfd];
@@ -1150,7 +1348,6 @@ int _connect(int sockfd, struct _sockaddr *addr)
     sem_wait(&inp->sem_connected);
      
 }
-
 
 int _recvfrom(int sockfd, char *str, struct _sockaddr *addr)
 {  
@@ -1262,7 +1459,22 @@ ifnet_class *net_init()
     tcp_init();
     socket_init();
 
-    return new_ifnet_class("192.168.1.200", "9e:4d:9e:e3:48:9f", 1500);
+    ifnet_class *ifp = new_ifnet_class("192.168.1.200",
+                                       "9e:4d:9e:e3:48:9f",
+                                       1500);
+    ifnet_register(ifp);                                  
+
+    route_add(inet_addr("192.168.1.0"),
+              inet_addr("255.255.255.0"),
+              0,
+              ifp);
+
+    route_add(0,
+              0,
+              inet_addr("192.168.1.1"),
+              ifp);
+
+    return ifp;
 }
 
 /*
@@ -1302,7 +1514,6 @@ void *tcp_thread(void *arg)
     server_addr.sin_addr.s_addr = inet_addr("192.168.1.1"); 
     server_addr.sin_port = htons(8080); 
 
-
     client_addr.sin_family = AF_INET;
     client_addr.sin_addr.s_addr = inet_addr("192.168.1.200"); 
     client_addr.sin_port = htons(1234); 
@@ -1330,11 +1541,11 @@ void *tcp_thread(void *arg)
 }
 
 
-
 int main() {
     pthread_t thread_id1, thread_id2, thread_id3;
 
     ifnet_class *ifp = net_init();
+    ifp->init("192.168.1.200", "9e:4d:9e:e3:48:9f", 1460);
 
     if (pthread_create(&thread_id1, NULL, net_thread, ifp) != 0) {
         perror("Failed to create thread1");
@@ -1350,5 +1561,3 @@ int main() {
         
     }
 }
-
-
